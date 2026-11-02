@@ -1,0 +1,5 @@
+Statement,Data,Period,"September 8, 2026 - October 6, 2026"
+现金报告,Header,货币总结,货币,总数,证券,期货
+现金报告,Data,期初现金,USD,0,0,0
+交易,Header,DataDiscriminator,资产分类,货币,代码,日期/时间,数量,交易价格,收益,佣金 USD
+交易,Data,Order,外汇,CNH,USD.CNH,"2026-09-08, 17:00:00",400,7,-2800,0
