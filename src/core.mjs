@@ -76,7 +76,7 @@ export function parseTrades(text,options={}) {
   if(!header)throw Error('未找到成交表头。支持中英文 IBKR 活动账单 CSV（含 .plain / .txt 扩展名），或使用标准成交模板。');
   if(trades.length>20000)throw Error('最小版本每次最多导入 20,000 笔成交');
   if(accounts.size>1)notes.push('检测到多个账户，FIFO 按匿名账户分别匹配。');
-  if(trades.some(t=>t.feeMissing))notes.push(trades.filter(t=>t.feeMissing).length+' 笔未提供佣金 / 费用，暂按 0 计算。');
+  if(trades.some(t=>t.feeMissing))notes.push(trades.filter(t=>t.feeMissing).length+' 笔缺少佣金 / 费用，受影响收益标为待核对，不按完整结果展示。');
   if(trades.some(t=>t.time==='00:00:00'))notes.push('部分成交没有时间，同日按文件顺序匹配。');
   const renamed=[...new Set(trades.filter(t=>t.originalSymbol!==t.symbol).map(t=>t.originalSymbol+' → '+t.symbol))];if(renamed.length)notes.push('根据账单同一合约信息合并历史代码：'+renamed.join('、')+'。');
   const fundingResult=parseFundingRows(rows,context,options);errors.push(...fundingResult.errors);if(fundingResult.funding.some(f=>f.kind==='opening'))notes.push('已读取期初美元现金余额；账单没有给出其人民币成本时，仅补齐美元数量，不猜测历史汇率。');if(fundingResult.funding.length)notes.push('已读取 '+fundingResult.funding.filter(f=>f.kind==='fx').length+' 笔美元 / 人民币换汇；人民币成本使用资金 FIFO 归属估算，需完整资金记录。');
@@ -93,12 +93,12 @@ export function fifo(trades,splits=[],asOf='9999-12-31') {
   const groups=new Map(),out=new Map(),events=[...trades.filter(t=>t.date<=asOf).map(t=>({...t,type:'trade'})),...splits.filter(s=>s.date<=asOf).map(s=>({...s,type:'split',time:''}))].sort((a,b)=>a.date.localeCompare(b.date)||(a.type==='split'?-1:b.type==='split'?1:a.time.localeCompare(b.time)||a.order-b.order));
   let realized=0,unmatched=0;
   for(const e of events){if(e.type==='split'){if(!Number.isFinite(e.ratio)||e.ratio<=0)throw Error('拆股比例无效');for(const lots of groups.values())for(const l of lots){l.qty*=e.ratio;l.unitCost/=e.ratio;}continue;}
-    const k=e.account+'|'+e.symbol+'|'+e.currency;if(!groups.has(k))groups.set(k,[]);const lots=groups.get(k);
-    if(e.side==='BUY'){lots.push({qty:e.qty,unitCost:e.price+e.fee/e.qty,date:e.date});out.set(e.id,{pnl:null,matched:0,unmatched:0,matches:[]});}
-    else {let remaining=e.qty,cost=0,matches=[];while(remaining>1e-9&&lots.length){const l=lots[0],q=Math.min(l.qty,remaining);cost+=q*l.unitCost;matches.push({date:l.date,qty:q,cost:q*l.unitCost});remaining-=q;l.qty-=q;if(l.qty<1e-9)lots.shift();}
-      const matched=e.qty-remaining,pnl=matched>1e-9?matched*e.price-e.fee*(matched/e.qty)-cost:null;if(pnl!==null)realized+=pnl;unmatched+=remaining;out.set(e.id,{pnl,matched,unmatched:remaining,matches});}
+    const k=(e.accountKey||e.account||'default')+'|'+e.symbol+'|'+e.currency;if(!groups.has(k))groups.set(k,[]);const lots=groups.get(k);
+    if(e.side==='BUY'){lots.push({qty:e.qty,unitCost:e.price+e.fee/e.qty,date:e.date,feeMissing:!!e.feeMissing});out.set(e.id,{pnl:null,matched:0,unmatched:0,matches:[]});}
+    else {let remaining=e.qty,cost=0,matches=[];while(remaining>1e-9&&lots.length){const l=lots[0],q=Math.min(l.qty,remaining);cost+=q*l.unitCost;matches.push({date:l.date,qty:q,cost:q*l.unitCost,feeMissing:!!l.feeMissing});remaining-=q;l.qty-=q;if(l.qty<1e-9)lots.shift();}
+      const matched=e.qty-remaining,pnl=matched>1e-9?matched*e.price-e.fee*(matched/e.qty)-cost:null;if(pnl!==null)realized+=pnl;unmatched+=remaining;out.set(e.id,{pnl,matched,unmatched:remaining,matches,feeMissing:!!e.feeMissing||matches.some(l=>l.feeMissing)});}
   }
-  let qty=0,cost=0;for(const lots of groups.values())for(const l of lots){qty+=l.qty;cost+=l.qty*l.unitCost;}return{realized,qty,cost,unmatched,rows:out};
+  let qty=0,cost=0;for(const lots of groups.values())for(const l of lots){qty+=l.qty;cost+=l.qty*l.unitCost;}return{realized,qty,cost,unmatched,rows:out,realizedComplete:[...out.values()].every(r=>r.unmatched<1e-8&&!r.feeMissing),costComplete:[...groups.values()].flat().every(l=>!l.feeMissing)};
 }
 export function rawYahoo(result) {
   const splits=Object.values(result.events?.splits??{}).map(e=>({date:new Intl.DateTimeFormat('en-CA',{timeZone:result.meta.exchangeTimezoneName||'America/New_York',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(e.date*1000)),ratio:Number(e.numerator)/Number(e.denominator)})).sort((a,b)=>a.date.localeCompare(b.date));
@@ -116,10 +116,36 @@ export function restoreWorkspace(saved){
   return{state:{...clean,...saved,schema:2,demo:false,trades,markets,universe:saved.universe||'ALL'},message:removed?'旧版虚构示例已移除。请导入你的 IBKR 账单。':saved.schema!==2&&trades.length?'已保留本地成交。请重新导入原账单，以核对历史改名及账单期末持仓。':''};
 }
 export function boundMarket(markets,k){const m=markets?.[k];if(!m||m.tradeKey!==k||!['csv','yahoo','nasdaq','stooq','twelve'].includes(m.source)||m.currency!==k.split('|').at(-1))return null;return m;}
+export function valuationMetric(value,reasons=[],estimated=false){return{value,status:value===null?'INCOMPLETE':estimated?'ESTIMATED':'VERIFIED',reasons:[...new Set(reasons)]};}
+export function tradeProfit(trade,calc,marketVerified=false){
+ if(trade.side==='BUY')return valuationMetric(0);
+ const r=calc.rows.get(trade.id),reasons=[];if(!r||r.unmatched>1e-8)reasons.push('卖出缺少买入成本');if(r?.feeMissing)reasons.push('成交费用缺失（卖出或配对买入）');
+ return valuationMetric(reasons.length?null:r.pnl,reasons,!marketVerified);
+}
 export function tradeSummary(trades,splits=[],from='0000',to='9999'){
-  const calc=fifo(trades,splits,to),visible=trades.filter(t=>t.date>=from&&t.date<=to),sells=visible.filter(t=>t.side==='SELL');
-  const realized=sells.reduce((a,t)=>a+(calc.rows.get(t.id)?.pnl??0),0),missing=sells.reduce((a,t)=>a+(calc.rows.get(t.id)?.unmatched??0),0);
-  return{calc,visible,sellCount:sells.length,buyCount:visible.filter(t=>t.side==='BUY').length,realized,missing,complete:missing<1e-8};
+ const calc=fifo(trades,splits,to),visible=trades.filter(t=>t.date>=from&&t.date<=to),sells=visible.filter(t=>t.side==='SELL');
+ const realized=sells.reduce((a,t)=>a+(calc.rows.get(t.id)?.pnl??0),0),missing=sells.reduce((a,t)=>a+(calc.rows.get(t.id)?.unmatched??0),0),reasons=[...new Set(sells.flatMap(t=>tradeProfit(t,calc).reasons))];
+ return{calc,visible,sellCount:sells.length,buyCount:visible.filter(t=>t.side==='BUY').length,realized,missing,complete:reasons.length===0,reasons};
+}
+export const MAX_QUOTE_AGE_DAYS=7;
+export function evaluateStock(trades,markets,stockKey,asOf,snapshot=null){
+ const ts=trades.filter(t=>t.symbol+'|'+t.currency===stockKey),[symbol,currency]=stockKey.split('|'),m=boundMarket(markets,stockKey),calc=fifo(ts,m?.splits||[],asOf),rReasons=[],uReasons=[];
+ const price=(m?.bars||[]).filter(b=>b.date<=asOf).sort((a,b)=>a.date.localeCompare(b.date)).at(-1);let realized=calc.realized,unrealized=0;
+ if(!ts.length){rReasons.push('缺少该持仓的成交历史');uReasons.push('缺少该持仓的成交历史');}
+ if(calc.unmatched>1e-8){rReasons.push('卖出缺少买入成本');uReasons.push('卖出缺少买入成本');}
+ if(!calc.realizedComplete)rReasons.push(...ts.filter(t=>t.side==='SELL'&&t.date<=asOf).flatMap(t=>tradeProfit(t,calc).reasons));
+ if(!calc.costComplete)uReasons.push('持仓买入费用缺失');
+ if(snapshot?.complete&&snapshot.asOf&&asOf>=snapshot.asOf){const reported=snapshot.positions.filter(p=>p.symbol===symbol&&p.currency===currency).reduce((n,p)=>n+p.qty,0);if(Math.abs(reported-calc.qty)>1e-8){rReasons.push('账单持仓与成交历史不一致');uReasons.push('账单持仓与成交历史不一致');}}
+ if(calc.qty>1e-8){if(!price||!m?.verified)uReasons.push('缺少可用行情（未取得或复权未核验）');else if((Date.parse(asOf)-Date.parse(price.date))/86400000>MAX_QUOTE_AGE_DAYS)uReasons.push('行情距估值日超过 7 天');else unrealized=calc.qty*price.close-calc.cost;}
+ if(rReasons.length)realized=null;if(uReasons.length)unrealized=null;
+ const r=valuationMetric(realized,rReasons,!m?.verified&&ts.some(t=>t.side==='SELL'&&t.date<=asOf)),u=valuationMetric(unrealized,uReasons),total=valuationMetric(realized===null||unrealized===null?null:realized+unrealized,[...rReasons,...uReasons],r.status==='ESTIMATED'||u.status==='ESTIMATED');
+ return{calc,realized,unrealized,total:total.value,cost:calc.costComplete?calc.cost:null,qty:calc.qty,price:price||null,priceDate:price?.date||null,metrics:{realized:r,unrealized:u,total},status:total.status,reasons:[...new Set([...rReasons,...uReasons])]};
+}
+export function stockReport(trades,markets,stockKey,from,to,snapshot=null){
+ const ts=trades.filter(t=>t.symbol+'|'+t.currency===stockKey),m=boundMarket(markets,stockKey),end=evaluateStock(ts,markets,stockKey,to,snapshot),previous=new Date(Date.parse(from+'T12:00:00Z')-86400000).toISOString().slice(0,10),start=evaluateStock(ts,markets,stockKey,previous,snapshot),summary=tradeSummary(ts,m?.splits||[],from,to);
+ const mismatch=end.reasons.some(r=>r.includes('持仓与成交历史')||r.includes('缺少该持仓')),periodRealized=summary.complete&&!mismatch?summary.realized:null,periodUnrealized=end.unrealized===null||start.unrealized===null?null:end.unrealized-start.unrealized,periodTotal=periodRealized===null||periodUnrealized===null?null:periodRealized+periodUnrealized;
+ const pR=valuationMetric(periodRealized,mismatch?end.reasons:summary.reasons,!m?.verified&&summary.sellCount>0),pU=valuationMetric(periodUnrealized,[...end.metrics.unrealized.reasons,...start.metrics.unrealized.reasons]),pT=valuationMetric(periodTotal,[...pR.reasons,...pU.reasons],pR.status==='ESTIMATED');
+ return{...end,key:stockKey,symbol:stockKey.split('|')[0],currency:stockKey.split('|')[1],summary,start,periodRealized,periodUnrealized,periodTotal,startPriceDate:start.priceDate,reasons:[...new Set([...end.reasons,...pR.reasons,...pU.reasons])],metrics:{...end.metrics,periodRealized:pR,periodUnrealized:pU,periodTotal:pT}};
 }
 export function portfolioEntries(trades,markets={},snapshot=null){
   const groups=new Map();for(const t of trades){const k=t.symbol+'|'+t.currency;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(t);}
@@ -161,24 +187,9 @@ export function mergeTradeFiles(existing,files){
  return{trades,stats:{incoming:incomingCount,added:Math.max(0,trades.length-existing.length),duplicates:Math.max(0,incomingCount-(trades.length-existing.length)),conflicts:conflicts.length},conflicts};
 }
 export function portfolioTotals(trades,markets={},from='0001-01-01',to='9999-12-31',snapshot=null){
- const previous=new Date(new Date(from+'T12:00:00Z').getTime()-86400000).toISOString().slice(0,10),groups=new Map();
- for(const t of trades){const k=t.symbol+'|'+t.currency;if(!groups.has(k))groups.set(k,[]);groups.get(k).push(t);}
- for(const p of snapshot?.positions||[])if(p.qty&& !groups.has(p.symbol+'|'+p.currency))groups.set(p.symbol+'|'+p.currency,[]);
- const currencies=new Map();
- for(const [k,ts] of groups){const currency=k.split('|').at(-1),symbol=k.split('|')[0],m=boundMarket(markets,k);
-  function at(date){const c=fifo(ts,m?.splits||[],date),price=(m?.bars||[]).filter(b=>b.date<=date).at(-1),reasons=[];let r=c.realized,u=0;
-   if(!ts.length){reasons.push('缺少该持仓的成交历史');r=null;u=null;}
-   if(c.unmatched>1e-8){reasons.push('卖出缺少买入成本');r=null;u=null;}
-   if(ts.some(t=>t.date<=date&&t.feeMissing)){reasons.push('成交费用缺失');r=null;u=null;}
-   if(snapshot?.complete&&snapshot.asOf&&date>=snapshot.asOf){const reported=snapshot.positions.filter(p=>p.symbol===symbol&&p.currency===currency).reduce((n,p)=>n+p.qty,0);if(Math.abs(reported-c.qty)>1e-8){reasons.push('账单持仓与成交历史不一致');r=null;u=null;}}
-   if(c.qty>1e-8&&u!==null){if(!price||!m?.verified){reasons.push('缺少可用行情');u=null;}else if((Date.parse(date)-Date.parse(price.date))/86400000>7){reasons.push('行情距估值日超过 7 天');u=null;}else u=c.qty*price.close-c.cost;}
-   return{realized:r,unrealized:u,total:r===null||u===null?null:r+u,qty:c.qty,priceDate:price?.date||null,reasons};
-  }
-  const end=at(to),start=ts.length&&previous<ts[0].date?{realized:0,unrealized:0,total:0,reasons:[]}:at(previous),sub=(a,b)=>a===null||b===null?null:a-b;
-  const row={key:k,symbol,currency,...end,periodRealized:sub(end.realized,start.realized),periodUnrealized:sub(end.unrealized,start.unrealized),periodTotal:sub(end.total,start.total),startPriceDate:start.priceDate||null,reasons:[...new Set([...end.reasons,...start.reasons])]};
-  if(!currencies.has(currency))currencies.set(currency,{currency,rows:[]});currencies.get(currency).rows.push(row);
- }
- const fields=['realized','unrealized','total','periodRealized','periodUnrealized','periodTotal'];return [...currencies.values()].map(g=>({...g,...Object.fromEntries(fields.map(f=>[f,g.rows.some(r=>r[f]===null)?null:g.rows.reduce((s,r)=>s+r[f],0)])),missing:g.rows.filter(r=>r.reasons.length).length}));
+ const keys=new Set(trades.map(t=>t.symbol+'|'+t.currency));for(const p of snapshot?.positions||[])if(p.qty)keys.add(p.symbol+'|'+p.currency);
+ const currencies=new Map();for(const k of keys){const row=stockReport(trades,markets,k,from,to,snapshot);if(!currencies.has(row.currency))currencies.set(row.currency,{currency:row.currency,rows:[]});currencies.get(row.currency).rows.push(row);}
+ const fields=['realized','unrealized','total','periodRealized','periodUnrealized','periodTotal'];return[...currencies.values()].map(g=>{const values=Object.fromEntries(fields.map(f=>[f,g.rows.some(r=>r[f]===null)?null:g.rows.reduce((s,r)=>s+r[f],0)])),metrics=Object.fromEntries(fields.map(f=>[f,valuationMetric(values[f],g.rows.flatMap(r=>r.metrics[f].reasons),g.rows.some(r=>r.metrics[f].status==='ESTIMATED'))]));return{...g,...values,metrics,status:metrics.total.status,missing:g.rows.filter(r=>r.reasons.length).length};});
 }
 // Funding records retain only monetary fields; never retain raw descriptions or account numbers.
 function parseFundingRows(rows,context,options={}){
@@ -234,9 +245,22 @@ export function cnyLedger(trades,funding,markets,asOf,rate){
  return{rows,sellPnl,buyCosts,cashShortfalls,openings:[...openings.values()].map(f=>({date:f.date,usd:f.usd,costKnown:Number.isFinite(f.cny)}))};
 }
 export function cnyPortfolioTotals(trades,funding,markets,from,to,snapshot,rate){
- const base=portfolioTotals(trades,markets,from,to,snapshot).find(g=>g.currency==='USD');if(!base)return{currency:'CNY',rows:[],realized:0,unrealized:0,total:0,periodRealized:0,periodUnrealized:0,periodTotal:0,missing:0};
+ const native=portfolioTotals(trades,markets,from,to,snapshot),base=native.find(g=>g.currency==='USD'),fields=['realized','unrealized','total','periodRealized','periodUnrealized','periodTotal'];
+ if(!base)return{currency:'CNY',rows:[],...Object.fromEntries(fields.map(f=>[f,0])),metrics:Object.fromEntries(fields.map(f=>[f,valuationMetric(0)])),missing:0,breakdown:cnyBreakdown(null,null,funding,rate,from,to)};
  const previous=new Date(Date.parse(from+'T12:00:00Z')-86400000).toISOString().slice(0,10),usdStarts=new Map((portfolioTotals(trades,markets,'0001-01-02',previous,snapshot).find(g=>g.currency==='USD')?.rows||[]).map(r=>[r.key,r])),ends=cnyLedger(trades,funding,markets,to,rate),starts=cnyLedger(trades,funding,markets,previous,rate),valid=Number.isFinite(rate)&&rate>0;
  function at(k,led,date,baseR,baseU){const r=led.rows.get(k)||{realized:0,qty:0,cost:0,realizedKnown:true,costKnown:true,realizedCostKnown:true},m=boundMarket(markets,k),price=m?.bars.filter(b=>b.date<=date).at(-1);return{realized:baseR===null||!r.realizedKnown?null:r.realized,unrealized:baseU===null||!r.costKnown?null:r.qty<1e-8?0:valid&&price?r.qty*price.close*rate-r.cost:null,cost:r.costKnown?r.cost:null};}
- const rows=base.rows.map(b=>{const end=at(b.key,ends,to,b.realized,b.unrealized),usdStart=usdStarts.get(b.key);const start=at(b.key,starts,previous,usdStart?usdStart.realized:0,usdStart?usdStart.unrealized:0);const total=x=>x.realized===null||x.unrealized===null?null:x.realized+x.unrealized,sub=(a,b)=>a===null||b===null?null:a-b;const reasons=[...b.reasons];if(!valid&&(b.qty>0||trades.some(t=>t.symbol===b.symbol&&t.side==='SELL'&&t.date<=to)))reasons.push('缺少当前 USD/CNY 汇率');if((!ends.rows.get(b.key)?.costKnown&&b.qty>0)||(ends.rows.get(b.key)?.realizedCostKnown===false&&!b.reasons.includes('卖出缺少买入成本')))reasons.push('人民币资金成本不完整（期初余额 / 现金缺口）');return{...b,...end,currency:'CNY',total:total(end),periodRealized:sub(end.realized,start.realized),periodUnrealized:sub(end.unrealized,start.unrealized),periodTotal:sub(total(end),total(start)),reasons:[...new Set(reasons)]};});
- const fields=['realized','unrealized','total','periodRealized','periodUnrealized','periodTotal'];return{currency:'CNY',rows,...Object.fromEntries(fields.map(f=>[f,rows.some(r=>r[f]===null)?null:rows.reduce((s,r)=>s+r[f],0)])),missing:rows.filter(r=>r.reasons.length).length};
+ const rows=base.rows.map(b=>{const end=at(b.key,ends,to,b.realized,b.unrealized),usdStart=usdStarts.get(b.key),start=at(b.key,starts,previous,usdStart?usdStart.realized:0,usdStart?usdStart.unrealized:0),sells=trades.filter(t=>t.symbol===b.symbol&&t.currency==='USD'&&t.side==='SELL'&&t.date>=from&&t.date<=to),saleValues=sells.map(t=>ends.sellPnl.get(t.id)),periodRealized=b.periodRealized===null||saleValues.some(n=>n===null||n===undefined)?null:saleValues.reduce((n,x)=>n+x,0),periodUnrealized=end.unrealized===null||start.unrealized===null?null:end.unrealized-start.unrealized,periodTotal=periodRealized===null||periodUnrealized===null?null:periodRealized+periodUnrealized;
+  const total=end.realized===null||end.unrealized===null?null:end.realized+end.unrealized,reasons=[...b.reasons];if(!valid&&(b.qty>0||trades.some(t=>t.symbol===b.symbol&&t.side==='SELL'&&t.date<=to)))reasons.push('缺少当前 USD/CNY 汇率');if((!ends.rows.get(b.key)?.costKnown&&b.qty>0)||(ends.rows.get(b.key)?.realizedCostKnown===false&&!b.reasons.includes('卖出缺少买入成本')))reasons.push('人民币资金成本不完整（期初余额 / 现金缺口）');
+  const values={...end,total,periodRealized,periodUnrealized,periodTotal},metrics=Object.fromEntries(fields.map(f=>[f,valuationMetric(values[f],values[f]===null?reasons:[],true)]));return{...b,...values,currency:'CNY',metrics,status:metrics.total.status,reasons:[...new Set(reasons)]};
+ });
+ const values=Object.fromEntries(fields.map(f=>[f,rows.some(r=>r[f]===null)?null:rows.reduce((s,r)=>s+r[f],0)])),metrics=Object.fromEntries(fields.map(f=>[f,valuationMetric(values[f],rows.flatMap(r=>r.metrics[f].reasons),true)])),result={currency:'CNY',rows,...values,metrics,status:metrics.total.status,missing:rows.filter(r=>r.reasons.length).length};result.breakdown=cnyBreakdown(base,result,funding,rate,from,to);return result;
+}
+export function cnyBreakdown(native,rmb,funding,rate,from,to){
+ const valid=Number.isFinite(rate)&&rate>0,part=(a,b)=>{const stockUsd=a??null,revaluedCny=b??null,stockCny=stockUsd!==null&&valid?stockUsd*rate:null;return{stockUsd,stockCny,revaluedCny,fxImpact:revaluedCny===null||stockCny===null?null:revaluedCny-stockCny};},receipts=new Map();
+ for(const f of funding||[])if(f.kind==='fx'&&f.usd<0&&f.cny<0&&f.date>=from&&f.date<=to){const c=f.quote||'CNH';receipts.set(c,(receipts.get(c)||0)-f.cny);}
+ return{cumulative:part(native?.total,rmb?.total),period:part(native?.periodTotal,rmb?.periodTotal),actualReceipts:[...receipts].map(([currency,amount])=>({currency,amount})),actualExchangeProfit:null,actualExchangeStatus:'INCOMPLETE',actualExchangeReason:'实际换回金额是现金回款，不是利润；资金池中本金与股票收益混合，未确认逐笔归属，无法给出实际已兑换收益。'};
+}
+export function reviewReport(trades,markets,stockKey,from,to,snapshot=null){
+ const report=stockReport(trades,markets,stockKey,from,to,snapshot),m=boundMarket(markets,stockKey);
+ return{report,rows:report.summary.visible.map(t=>{const p=tradeProfit(t,report.calc,!!m?.verified),mismatch=report.reasons.includes('账单持仓与成交历史不一致'),metric=mismatch?valuationMetric(null,['账单持仓与成交历史不一致']):p;return{...t,realizedPnl:t.side==='SELL'?metric.value:null,valuationStatus:metric.status,valuationReasons:metric.reasons,asOf:to,unrealized:report.unrealized,unrealizedStatus:report.metrics.unrealized.status,unrealizedReasons:report.metrics.unrealized.reasons,source:m?.source||'none'};})};
 }
